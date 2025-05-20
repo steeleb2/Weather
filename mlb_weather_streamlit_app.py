@@ -3,14 +3,12 @@ import pandas as pd
 import requests
 from datetime import datetime
 import time
-
-# Fallback geocoder (geopy) for improved city lookup
+import pytz
 from geopy.geocoders import Nominatim
 
 st.set_page_config(page_title="MLB Game Weather", layout="wide")
-st.title("🌦️ Today's MLB Game Weather Dashboard")
+st.title("🌦️ Today's MLB Game Weather Dashboard (Eastern Time & °F)")
 
-# Ballpark mapping: MLB venues and common alternates/spring training
 MLB_BALLPARKS = {
     'Angel Stadium': 'Anaheim',
     'Chase Field': 'Phoenix',
@@ -23,7 +21,7 @@ MLB_BALLPARKS = {
     'Globe Life Field': 'Arlington',
     'Great American Ball Park': 'Cincinnati',
     'Guaranteed Rate Field': 'Chicago',
-    'Rate Field': 'Chicago',  # Sometimes abbreviated in API
+    'Rate Field': 'Chicago',
     'Kauffman Stadium': 'Kansas City',
     'loanDepot park': 'Miami',
     'Minute Maid Park': 'Houston',
@@ -43,13 +41,10 @@ MLB_BALLPARKS = {
     'Yankee Stadium': 'New York',
     'American Family Field': 'Milwaukee',
     'Busch Stadium': 'St. Louis',
-    # Spring training/neutral sites
     'George M. Steinbrenner Field': 'Tampa',
     'Sutter Health Park': 'Sacramento',
-    # Add more venues as needed
 }
 
-# MLB Stats API for today's schedule
 @st.cache_data(ttl=3600)
 def get_today_mlb_games():
     today = datetime.now().strftime('%Y-%m-%d')
@@ -73,10 +68,8 @@ def get_today_mlb_games():
     except Exception as e:
         return [], {"error": str(e)}
 
-# Robust city geocoder: Try Open-Meteo, then geopy/Nominatim
 @st.cache_data(ttl=86400)
 def get_lat_lon(city):
-    # First, try Open-Meteo geocoding API
     url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json"
     try:
         r = requests.get(url, timeout=10)
@@ -88,7 +81,6 @@ def get_lat_lon(city):
             return lat, lon
     except Exception:
         pass
-    # Fallback: geopy Nominatim
     try:
         geolocator = Nominatim(user_agent="mlb_weather_app")
         location = geolocator.geocode(city)
@@ -107,7 +99,7 @@ def get_weather(lat, lon, dt):
            f"&hourly=temperature_2m,precipitation_probability,weathercode,windspeed_10m"
            f"&start={date_str}T00:00"
            f"&end={date_str}T23:59"
-           f"&timezone=auto")
+           f"&timezone=America/New_York")
     try:
         r = requests.get(url)
         r.raise_for_status()
@@ -121,13 +113,21 @@ def get_weather(lat, lon, dt):
                     idx = i
                     break
             if idx is None:
-                idx = 0  # Fallback: first hour
+                idx = 0
             temp = data["hourly"]["temperature_2m"][idx]
             precip = data["hourly"]["precipitation_probability"][idx]
             wind = data["hourly"]["windspeed_10m"][idx]
         return temp, precip, wind
     except Exception:
         return None, None, None
+
+# Convert UTC to Eastern Time and nicely format
+def format_to_eastern(dt_str):
+    utc = pytz.utc
+    eastern = pytz.timezone('US/Eastern')
+    dt_utc = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
+    dt_eastern = dt_utc.astimezone(eastern)
+    return dt_eastern.strftime("%Y-%m-%d %I:%M %p ET"), dt_eastern.hour
 
 st.info("Fetching today's MLB games and weather data...")
 
@@ -140,41 +140,48 @@ if "error" in raw_json:
 st.write(f"Number of games scheduled for today: **{len(games)}**")
 if len(games) == 0:
     st.warning("No MLB games scheduled for today (or failed to fetch the schedule).")
-    st.json(raw_json)  # Show the actual data returned by MLB API for debugging
+    st.json(raw_json)
 else:
-    # Print all scheduled games for transparency
     st.write("Scheduled Games:")
     for g in games:
-        st.write(f'- {g["away_name"]} @ {g["home_name"]} at {g["venue"]}, game time: {g["game_time"]}')
+        local_time, _ = format_to_eastern(g["game_time"])
+        st.write(f'- {g["away_name"]} @ {g["home_name"]} at {g["venue"]}, game time: {local_time}')
 
     game_data = []
     for g in games:
         ballpark = g["venue"]
         matchup = f'{g["away_name"]} @ {g["home_name"]}'
-        game_time = pd.to_datetime(g["game_time"]).strftime("%Y-%m-%d %I:%M %p")
+        game_time_str, game_hour_eastern = format_to_eastern(g["game_time"])
         city = MLB_BALLPARKS.get(ballpark)
         if not city:
             st.warning(f"Ballpark not mapped for weather lookup: {ballpark}")
-            continue  # Skip unknown parks
+            continue
         st.write(f"Looking up weather for {matchup} in {city}...")
         lat, lon = get_lat_lon(city)
         if not lat:
             st.warning(f"Failed to geocode city: {city}")
             continue
-        temp, precip, wind = get_weather(lat, lon, g["game_time"])
-        if temp is None:
+        # Pass the Eastern Time hour to get weather for correct local time
+        # We'll adjust the dt to today's date and the ET hour for the forecast
+        date = datetime.now(pytz.timezone("US/Eastern"))
+        dt_for_weather = date.replace(hour=game_hour_eastern, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00Z")
+        temp_c, precip, wind_kmh = get_weather(lat, lon, dt_for_weather)
+        if temp_c is None:
             st.warning(f"Failed to fetch weather for {matchup} ({city})")
+        # Convert to Fahrenheit and mph
+        temp_f = round(temp_c * 9/5 + 32, 1) if temp_c is not None else None
+        wind_mph = round(wind_kmh * 0.621371, 1) if wind_kmh is not None else None
         game_data.append({
             "Matchup": matchup,
             "Ballpark": ballpark,
             "Location": city,
-            "Game Time": game_time,
-            "Temp (°C)": temp,
+            "Game Time (ET)": game_time_str,
+            "Temp (°F)": temp_f,
             "Precip (%)": precip,
-            "Wind (km/h)": wind,
+            "Wind (mph)": wind_mph,
             "Link": g["link"]
         })
-        time.sleep(0.3)  # Respect APIs
+        time.sleep(0.3)
 
     df = pd.DataFrame(game_data)
 
@@ -182,4 +189,6 @@ else:
         st.warning("Games scheduled, but failed to fetch weather data for all games. See above warnings.")
     else:
         st.dataframe(df)
-        st.caption("Weather data from Open-Meteo (or geopy fallback). MLB games from MLB Stats API.")
+        st.caption("Weather data from Open-Meteo (°F, mph). Game times shown in U.S. Eastern Time.")
+
+
